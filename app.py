@@ -1,58 +1,90 @@
 import streamlit as st
 from bs4 import BeautifulSoup
 import re
-from fpdf import FPDF
-from pypdf import PdfReader
+import pdfplumber
 
-# Set Page Config
-st.set_page_config(page_title="Opsify Credit Report Parser", page_icon="📑", layout="wide")
+st.set_page_config(page_title="Opsify Credit Report Parser", page_icon="🛡️", layout="wide")
 
 st.title("🛡️ Opsify Dispute Automation Tool")
 st.write("Upload client's credit report (PDF, HTML, or TXT) to instantly extract negative items and build dispute letters.")
 
-# Sidebar for Client Info
+# Sidebar
 st.sidebar.header("👤 Client Details")
-client_name = st.sidebar.text_input("Client Full Name", "John Doe")
-client_dob = st.sidebar.text_input("Date of Birth", "01/01/1990")
-client_ssn = st.sidebar.text_input("SSN (Last 4)", "1234")
-client_address = st.sidebar.text_area("Current Address", "123 Main St, City, ST 12345")
+client_name = st.sidebar.text_input("Client Full Name", "Sophia Baker")
+client_dob = st.sidebar.text_input("Date of Birth", "09/07/1974")
+client_ssn = st.sidebar.text_input("SSN (Last 4)", "9139")
+client_address = st.sidebar.text_area("Current Address", "1119 Madison St, Bogalusa Louisiana 70427")
 bureau = st.sidebar.selectbox("Select Target Bureau", ["Experian", "Equifax", "TransUnion"])
 
-# File Uploader - Now supports PDF!
 uploaded_file = st.file_uploader("Upload Credit Report (PDF, HTML, or TXT)", type=["pdf", "html", "htm", "txt"])
 
 if uploaded_file is not None:
-    content = ""
     file_type = uploaded_file.name.split(".")[-1].lower()
+    raw_text = ""
     
-    # Read PDF or HTML/TXT
-    if file_type == "pdf":
-        reader = PdfReader(uploaded_file)
-        for page in reader.pages:
-            content += page.extract_text() + "\n"
-    else:
-        content = uploaded_file.read().decode("utf-8", errors="ignore")
-        
-    soup = BeautifulSoup(content, "html.parser") if file_type in ["html", "htm"] else None
-    
-    st.success("File uploaded successfully! Parsing data...")
-    
-    # -------------------------------------------------------------
-    # PARSING ENGINE LOGIC
-    # -------------------------------------------------------------
     incorrect_addresses = []
     negative_accounts = []
-    positive_creditors = []
     unattached_inquiries = []
-    
-    if soup:
-        # HTML Parsing Logic
-        addr_elements = soup.find_all(class_=re.compile(r'address|prev-addr', re.I))
-        for el in addr_elements:
-            txt = el.get_text(strip=True)
-            if client_address.strip().lower() not in txt.lower() and txt not in incorrect_addresses:
-                incorrect_addresses.append(txt)
 
+    # -------------------------------------------------------------
+    # 1. PDF PARSER ENGINE (pdfplumber)
+    # -------------------------------------------------------------
+    if file_type == "pdf":
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    raw_text += page_text + "\n"
+        
+        # Split text into chunks/lines
+        lines = raw_text.split("\n")
+        
+        for i, line in enumerate(lines):
+            line_upper = line.upper()
+            
+            # --- Detect Negative Accounts ---
+            neg_keywords = ["COLLECTION", "CHARGE-OFF", "CHARGED OFF", "REPOSSESSION", "FORECLOSURE", "PAST DUE", "DELINQUENT", "LATE 30", "LATE 60", "LATE 90", "DEROGATORY"]
+            if any(kw in line_upper for kw in neg_keywords):
+                # Context extraction: Kunin ang katabing linya para sa Creditor Name
+                creditor_name = lines[i-1].strip() if i > 0 else "Unknown Creditor"
+                if len(creditor_name) < 3 or any(kw in creditor_name.upper() for kw in neg_keywords):
+                    creditor_name = line[:25]
+                
+                # Extract Account Number
+                acct_match = re.search(r'#?\b[A-Z0-9*]{4,}\b', line)
+                acct_no = acct_match.group(0) if acct_match else "Unverified/N/A"
+                
+                negative_accounts.append({
+                    "creditor": creditor_name,
+                    "acct": acct_no,
+                    "status": line_upper[:40]
+                })
+
+            # --- Detect Hard Inquiries ---
+            if "INQUIRY" in line_upper or "INQUIRIES" in line_upper or re.search(r'\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2},\s+20\d{2}\b', line_upper):
+                if not any(header in line_upper for header in ["PERMISSIBLE", "TYPES OF INQUIRIES", "RECORD OF INQUIRIES"]):
+                    inq_date_match = re.search(r'\d{2}/\d{2}/\d{4}', line)
+                    inq_date = inq_date_match.group(0) if inq_date_match else "N/A"
+                    unattached_inquiries.append({
+                        "creditor": line[:30].strip(),
+                        "date": inq_date
+                    })
+
+            # --- Detect Previous Addresses ---
+            if "ADDRESS" in line_upper or "PRIOR ADDRESS" in line_upper:
+                if client_address.strip().lower() not in line.lower():
+                    clean_addr = re.sub(r'ADDRESS|PRIOR|PREVIOUS', '', line, flags=re.I).strip()
+                    if len(clean_addr) > 8 and clean_addr not in incorrect_addresses:
+                        incorrect_addresses.append(clean_addr)
+
+    # -------------------------------------------------------------
+    # 2. HTML PARSER ENGINE (BS4)
+    # -------------------------------------------------------------
+    elif file_type in ["html", "htm"]:
+        content = uploaded_file.read().decode("utf-8", errors="ignore")
+        soup = BeautifulSoup(content, "html.parser")
+        
+        # HTML Extraction Logic
         account_blocks = soup.find_all(class_=re.compile(r'account-row|tradeline', re.I))
         for block in account_blocks:
             creditor = block.find(class_=re.compile(r'creditor-name|account-name', re.I))
@@ -63,34 +95,10 @@ if uploaded_file is not None:
             s_val = status.get_text(strip=True).upper() if status else ""
             a_num = acct_num.get_text(strip=True) if acct_num else "N/A"
             
-            is_neg = any(k in s_val for k in ["COLLECTION", "CHARGE-OFF", "PAST DUE", "DELINQUENT", "LATE"])
-            if is_neg:
+            if any(k in s_val for k in ["COLLECTION", "CHARGE-OFF", "PAST DUE", "DELINQUENT", "LATE"]):
                 negative_accounts.append({"creditor": c_name, "acct": a_num, "status": s_val})
-            else:
-                positive_creditors.append(c_name.upper())
 
-        inquiry_blocks = soup.find_all(class_=re.compile(r'inquiry-row|inquiry-item', re.I))
-        for inq in inquiry_blocks:
-            cred = inq.find(class_=re.compile(r'inquiry-name|creditor', re.I))
-            date = inq.find(class_=re.compile(r'inquiry-date|date', re.I))
-            
-            c_txt = cred.get_text(strip=True).upper() if cred else ""
-            d_txt = date.get_text(strip=True) if date else "N/A"
-            
-            if c_txt:
-                matched = any(pos in c_txt or c_txt in pos for pos in positive_creditors)
-                if not matched:
-                    unattached_inquiries.append({"creditor": c_txt, "date": d_txt})
-    else:
-        # PDF/Text Regex Parsing Logic
-        lines = content.split("\n")
-        for line in lines:
-            line_str = line.strip()
-            # Basic Regex Flags for PDF text
-            if any(k in line_str.upper() for k in ["COLLECTION", "CHARGE-OFF", "PAST DUE", "DELINQUENT"]):
-                negative_accounts.append({"creditor": line_str[:30], "acct": "Check PDF", "status": "Negative"})
-            elif "INQUIRY" in line_str.upper() or "INQUIRIES" in line_str.upper():
-                unattached_inquiries.append({"creditor": line_str[:30], "date": "Check PDF"})
+    st.success("File parsed successfully!")
 
     # -------------------------------------------------------------
     # DASHBOARD DISPLAY
@@ -109,7 +117,7 @@ if uploaded_file is not None:
         st.subheader("🚨 Negative Accounts")
         if negative_accounts:
             for acc in negative_accounts:
-                st.error(f"**{acc['creditor']}**\nAcct: {acc['acct']} | Status: {acc['status']}")
+                st.error(f"**{acc['creditor']}**\nAcct #: {acc['acct']}\nStatus: {acc['status']}")
         else:
             st.info("No negative accounts flagged.")
 
@@ -122,9 +130,9 @@ if uploaded_file is not None:
             st.info("No unattached inquiries flagged.")
 
     st.markdown("---")
-    
+
     # -------------------------------------------------------------
-    # AUTOMATED LETTER GENERATOR
+    # LETTER GENERATOR
     # -------------------------------------------------------------
     st.subheader("📄 Generated Dispute Letter Preview")
     
@@ -137,17 +145,17 @@ if uploaded_file is not None:
     if incorrect_addresses:
         letter_text += "1. INACCURATE PERSONAL INFORMATION:\n"
         for addr in incorrect_addresses:
-            letter_text += f"   - Please DELETE Address: {addr}\n"
+            letter_text += f"   - Delete Address: {addr}\n"
         letter_text += "\n"
 
     if negative_accounts:
         letter_text += "2. UNVERIFIED NEGATIVE ACCOUNTS (FCRA § 611):\n"
         for acc in negative_accounts:
-            letter_text += f"   - Creditor: {acc['creditor']} | Acct #: {acc['acct']} | Reported Status: {acc['status']}\n"
+            letter_text += f"   - Creditor: {acc['creditor']} | Acct #: {acc['acct']} | Status: {acc['status']}\n"
         letter_text += "\n"
 
     if unattached_inquiries:
-        letter_text += "3. UNAUTHORIZED HARD INQUIRIES (FCRA § 604 - Lack of Permissible Purpose):\n"
+        letter_text += "3. UNAUTHORIZED HARD INQUIRIES (FCRA § 604):\n"
         for inq in unattached_inquiries:
             letter_text += f"   - Inquiry: {inq['creditor']} | Date: {inq['date']}\n"
         letter_text += "\n"
