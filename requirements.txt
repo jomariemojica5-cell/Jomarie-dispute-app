@@ -1,4 +1,1 @@
-streamlit
-beautifulsoup4
-fpdf
-pypdf
+pdfplumber
